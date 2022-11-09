@@ -1,0 +1,25 @@
+{
+    "model": {
+        "type": "bert_24b"
+    },
+    "hyperparameter": {
+        "batch_size": 8,
+        "global_batch_size": 512,
+        "learning_rate": 0.0001,
+        "min_lr": 0.00001,
+        "num_epochs": 2,
+        "steps_per_epoch": 10,
+        "warmup_steps": 4
+    },
+    "fp16": {
+        "initial_scale": 32768
+    },
+    "gradient_checkpoint": false,
+    "clip_grad_norm": 1.0,
+    "parallel": {
+        "tensor": {
+            "mode": "3d",
+            "size": 8
+        }
+    }
+}
