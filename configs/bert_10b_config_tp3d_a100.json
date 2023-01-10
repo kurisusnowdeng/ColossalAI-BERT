@@ -1,6 +1,9 @@
 {
     "model": {
-        "type": "bert_oppo",
+        "type": "bert_oppo_10b",
+        "hidden_size": 4800,
+        "ff_size": 19200,
+        "num_heads": 40,
         "flash_attention": true
     },
     "hyperparameter": {

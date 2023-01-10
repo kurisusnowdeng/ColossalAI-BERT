@@ -3,7 +3,7 @@ import os
 from colossalai.core import global_context as gpc
 
 from helper import init_w_col
-from train import train
+from pretrain import train
 from utils import get_args, get_config
 
 
@@ -16,8 +16,8 @@ def setup_mpi():
     WORLD_SIZE = int(os.environ.get('WORLD_SIZE', 1))
     RANK = os.environ.get('RANK')
     LOCAL_RANK = os.environ.get('LOCAL_RANK')
-    print("MASTER_ADDR:{}, MASTER_PORT:{}, WORLD_SIZE:{}, RANK:{}, LOCAL_RANK:{}".format(
-        MASTER_ADDR, MASTER_PORT, WORLD_SIZE, RANK, LOCAL_RANK))
+    print("MASTER_ADDR:{}, MASTER_PORT:{}, WORLD_SIZE:{}, RANK:{}, LOCAL_RANK:{}".format(MASTER_ADDR, MASTER_PORT, WORLD_SIZE,
+                                                                                         RANK, LOCAL_RANK))
 
 
 def run_bert():

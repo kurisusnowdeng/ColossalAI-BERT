@@ -1,11 +1,11 @@
 {
     "model": {
         "type": "bert_oppo",
-        "flash_attention": true
+        "flash_attention": false
     },
     "hyperparameter": {
-        "batch_size": 20,
-        "global_batch_size": 4100,
+        "batch_size": 16,
+        "global_batch_size": 4096,
         "learning_rate": 0.0001,
         "min_lr": 0.00001,
         "num_epochs": 2,

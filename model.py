@@ -5,15 +5,15 @@ import math
 
 import torch
 from colossalai import nn as col_nn
-from colossalai.kernel import FusedScaleMaskSoftmax
-from colossalai.kernel.cuda_native.scaled_softmax import AttnMaskType
+from colossalai.kernel.cuda_native.scaled_softmax import AttnMaskType, FusedScaleMaskSoftmax
+from colossalai.kernel.cuda_native.flash_attention import MemoryEfficientAttention
 from colossalai.nn.layer.utils import divide
 from colossalai.utils import get_current_device
 from einops import rearrange
 from flash_attn.flash_attention import FlashAttention
 from torch import nn
 from transformers.activations import ACT2FN
-from transformers.modeling_outputs import MaskedLMOutput
+from transformers.modeling_outputs import (BaseModelOutput, MaskedLMOutput, SequenceClassifierOutput)
 
 
 @torch.jit.script
@@ -115,8 +115,7 @@ class BertSelfAttention(nn.Module):
         self.num_attention_heads = config.num_attention_heads
         self.attention_head_size = divide(config.hidden_size, config.num_attention_heads)
 
-        self.query_key_value = col_nn.Linear(config.hidden_size,
-                                             self.num_attention_heads * self.attention_head_size * 3)
+        self.query_key_value = col_nn.Linear(config.hidden_size, self.num_attention_heads * self.attention_head_size * 3)
 
         if self.flash_attn:
             self.attention_func = FlashAttention(softmax_scale=math.sqrt(self.attention_head_size),
@@ -130,6 +129,7 @@ class BertSelfAttention(nn.Module):
                                                         softmax_in_fp32=True,
                                                         scale=math.sqrt(self.attention_head_size))
             self.dropout = col_nn.Dropout(config.attention_probs_dropout_prob)
+            # self.attention_func = MemoryEfficientAttention(config.hidden_size, self.num_attention_heads, 0.0)
 
     def forward(self, hidden_states, attention_mask=None):
         qkv = self.query_key_value(hidden_states)
@@ -137,7 +137,7 @@ class BertSelfAttention(nn.Module):
         num_attention_heads = divide(all_head_size, self.attention_head_size)
         if self.flash_attn:
             qkv = rearrange(qkv, 'b s (three h d) -> b s three h d', three=3, h=num_attention_heads)
-            context, _ = self.attention_func(qkv, key_padding_mask=attention_mask.bool(), causal=False)
+            context, _ = self.attention_func(qkv, key_padding_mask=attention_mask, causal=False)
             context = rearrange(context, 'b s h d -> b s (h d)')
         else:
             new_qkv_shape = qkv.shape[:-1] + \
@@ -146,12 +146,7 @@ class BertSelfAttention(nn.Module):
             qkv = qkv.permute((0, 2, 1, 3))
             q, k, v = torch.chunk(qkv, 3, dim=-1)
 
-            query_layer = q
-            key_layer = k
-            value_layer = v
-
-            # Take the dot product between "query" and "key" to get the raw attention scores.
-            attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
+            attention_scores = torch.matmul(q, k.transpose(-1, -2))
 
             attention_probs = self.attention_func(
                 attention_scores,
@@ -159,11 +154,13 @@ class BertSelfAttention(nn.Module):
             )
             attention_probs = self.dropout(attention_probs)
 
-            context = torch.matmul(attention_probs, value_layer)
+            context = torch.matmul(attention_probs, v)
 
             context = context.permute(0, 2, 1, 3).contiguous()
             new_context_shape = context.size()[:-2] + (all_head_size, )
             context = context.view(new_context_shape)
+
+            # context = self.attention_func(q, k, v, None)
 
         return context
 
@@ -256,20 +253,22 @@ class BertEmbeddings(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.word_embeddings = col_nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
-        self.token_type_embeddings = col_nn.Embedding(config.type_vocab_size, config.hidden_size)
         self.position_embeddings = col_nn.Embedding(config.max_position_embeddings, config.hidden_size)
+        self.token_type_embeddings = col_nn.Embedding(config.type_vocab_size, config.hidden_size)
 
+        self.LayerNorm = col_nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = col_nn.Dropout(config.hidden_dropout_prob)
         # position_ids (1, len position emb) is contiguous in memory and exported when serialized
-        self.position_ids = torch.arange(config.max_position_embeddings).expand((1, -1)).to(get_current_device())
+        self.position_embedding_type = getattr(config, "position_embedding_type", "absolute")
+        self.position_ids = torch.arange(config.max_position_embeddings, device=get_current_device()).expand((1, -1))
+        self.token_type_ids = torch.zeros(self.position_ids.size(), dtype=torch.long, device=get_current_device())
 
-    def forward(self, input_ids, token_type_ids=None, position_ids=None):
+    def forward(self, input_ids, token_type_ids=None):
         input_shape = input_ids.size()
         batch_size = input_shape[0]
         seq_length = input_shape[1]
 
-        if position_ids is None:
-            position_ids = self.position_ids[:, :seq_length].expand(batch_size, -1)
+        position_ids = self.position_ids[:, :seq_length].expand(batch_size, -1)
 
         if token_type_ids is None:
             token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=self.position_ids.device)
@@ -279,8 +278,10 @@ class BertEmbeddings(nn.Module):
         token_type_embeddings = self.token_type_embeddings(token_type_ids)
 
         embeddings = inputs_embeds + token_type_embeddings
-        position_embeddings = self.position_embeddings(position_ids)
-        embeddings += position_embeddings
+        if self.position_embedding_type == "absolute":
+            position_embeddings = self.position_embeddings(position_ids)
+            embeddings += position_embeddings
+        embeddings = self.LayerNorm(embeddings)
         embeddings = self.dropout(embeddings)
         return embeddings
 
@@ -299,15 +300,20 @@ class BertEncoder(nn.Module):
         return hidden_states
 
 
-class ColoBertMaskedLMLoss(torch.nn.Module):
+class BertPooler(nn.Module):
 
-    def __init__(self):
+    def __init__(self, config):
         super().__init__()
-        self.loss = col_nn.CrossEntropyLoss()
+        self.dense = col_nn.Linear(config.hidden_size, config.hidden_size)
+        self.activation = nn.Tanh()
 
-    def forward(self, logits, labels):
-        # Flatten the tokens
-        return self.loss(logits.view(-1, logits.size(-1)), labels.view(-1))
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # We "pool" the model by simply taking the hidden state corresponding
+        # to the first token.
+        first_token_tensor = hidden_states[:, 0]
+        pooled_output = self.dense(first_token_tensor)
+        pooled_output = self.activation(pooled_output)
+        return pooled_output
 
 
 class BertModel(nn.Module):
@@ -328,13 +334,7 @@ class BertModel(nn.Module):
         self.embeddings = BertEmbeddings(config)
         self.encoder = BertEncoder(config)
 
-    def forward(
-        self,
-        input_ids,
-        attention_mask=None,
-        token_type_ids=None,
-        position_ids=None,
-    ):
+    def forward(self, input_ids, token_type_ids=None, attention_mask=None):
         input_shape = input_ids.size()
         batch_size, seq_length = input_shape
         device = input_ids.device
@@ -347,40 +347,48 @@ class BertModel(nn.Module):
             else:
                 token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
 
-        embedding_output = self.embeddings(input_ids=input_ids,
-                                           position_ids=position_ids,
-                                           token_type_ids=token_type_ids)
+        embedding_output = self.embeddings(input_ids=input_ids, token_type_ids=token_type_ids)
 
-        if attention_mask is not None and not self.config.flash_attention:
-            batch_size = input_ids.shape[0]
-            attention_mask = attention_mask.view(batch_size, -1)
+        if attention_mask is not None:
             attention_mask = col_nn.partition_batch(attention_mask)
-            attention_mask_b1s = attention_mask.unsqueeze(1)
-            # [b, s, 1]
-            attention_mask_bs1 = attention_mask.unsqueeze(2)
-            # [b, s, s]
-            attention_mask_bss = attention_mask_b1s * attention_mask_bs1
-            # [b, 1, s, s]
-            extended_attention_mask = attention_mask_bss.unsqueeze(1)
-            extended_attention_mask = (extended_attention_mask < 0.5)
-            attention_mask = extended_attention_mask.to(dtype=embedding_output.dtype)
+
+            if self.config.flash_attention:
+                attention_mask = attention_mask.bool()
+            else:
+                batch_size = attention_mask.shape[0]
+                attention_mask = attention_mask.view(batch_size, -1)
+                attention_mask_b1s = attention_mask.unsqueeze(1)
+                # [b, s, 1]
+                attention_mask_bs1 = attention_mask.unsqueeze(2)
+                # [b, s, s]
+                attention_mask_bss = attention_mask_b1s * attention_mask_bs1
+                # [b, 1, s, s]
+                extended_attention_mask = attention_mask_bss.unsqueeze(1)
+                extended_attention_mask = (extended_attention_mask < 0.5)
+                attention_mask = extended_attention_mask.to(dtype=embedding_output.dtype)
 
         encoder_outputs = self.encoder(embedding_output, attention_mask=attention_mask)
 
-        return encoder_outputs
+        return BaseModelOutput(last_hidden_state=encoder_outputs)
 
 
 class BertPredictionHeadTransform(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.dense = col_nn.Linear(config.hidden_size, config.hidden_size, gather_output=True)
-        self.transform_act_fn = ACT2FN[config.hidden_act]
+        self.dense = col_nn.Linear(
+            config.hidden_size,
+            config.hidden_size,
+            gather_output=True,
+            skip_bias_add=True,
+        )
+        # self.transform_act_fn = ACT2FN[config.hidden_act]
         self.LayerNorm = col_nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def forward(self, hidden_states):
-        hidden_states = self.dense(hidden_states)
-        hidden_states = self.transform_act_fn(hidden_states)
+        hidden_states, bias = self.dense(hidden_states)
+        # hidden_states = self.transform_act_fn(hidden_states)
+        hidden_states = bias_gelu(hidden_states, bias)
         hidden_states = self.LayerNorm(hidden_states)
         return hidden_states
 
@@ -401,7 +409,18 @@ class BertLMPredictionHead(nn.Module):
         return hidden_states
 
 
-class ColoBertForMaskedLM(nn.Module):
+class BertMaskedLMLoss(torch.nn.Module):
+
+    def __init__(self):
+        super().__init__()
+        self.loss = col_nn.CrossEntropyLoss()
+
+    def forward(self, logits, labels):
+        # Flatten the tokens
+        return self.loss(logits.view(-1, logits.size(-1)), labels.view(-1))
+
+
+class BertForMaskedLM(nn.Module):
 
     def __init__(self, config):
         super().__init__()
@@ -409,18 +428,33 @@ class ColoBertForMaskedLM(nn.Module):
         self.bert = BertModel(config)
         self.cls = BertLMPredictionHead(config, self.bert.embeddings.word_embeddings.weight)
 
-    def forward(
-        self,
-        input_ids,
-        attention_mask=None,
-        token_type_ids=None,
-        position_ids=None,
-    ):
-        outputs = self.bert(input_ids,
-                            attention_mask=attention_mask,
-                            token_type_ids=token_type_ids,
-                            position_ids=position_ids)
+    def forward(self, input_ids, attention_mask=None, token_type_ids=None):
+        outputs = self.bert(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
 
-        prediction_scores = self.cls(outputs)
+        prediction_scores = self.cls(outputs.last_hidden_state)
 
         return MaskedLMOutput(logits=prediction_scores)
+
+
+class BertForSequenceClassification(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.num_labels = config.num_labels
+        self.config = config
+
+        self.bert = BertModel(config)
+        self.pooler = BertPooler(config)
+
+        classifier_dropout = (config.classifier_dropout
+                              if config.classifier_dropout is not None else config.hidden_dropout_prob)
+        self.dropout = col_nn.Dropout(classifier_dropout)
+        self.classifier = col_nn.Classifier(config.hidden_size, config.num_labels)
+
+    def forward(self, input_ids, token_type_ids=None, attention_mask=None):
+        outputs = self.bert(input_ids, token_type_ids=token_type_ids, attention_mask=attention_mask)
+        pooled_output = self.pooler(outputs.last_hidden_state)
+        pooled_output = self.dropout(pooled_output)
+        logits = self.classifier(pooled_output)
+
+        return SequenceClassifierOutput(logits=logits)

@@ -1,4 +1,4 @@
 transformers
 datasets==1.18.0
+nltk
 torch>=1.10 -f https://download.pytorch.org/whl/cu113/torch_stable.html
-colossalai

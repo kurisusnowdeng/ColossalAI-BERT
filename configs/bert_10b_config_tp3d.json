@@ -1,16 +1,20 @@
 {
     "model": {
-        "type": "bert_oppo",
-        "flash_attention": true
+        "type": "bert_oppo_10b",
+        "hidden_size": 4096,
+        "ff_size": 16384,
+        "num_heads": 32,
+        "depth": 50,
+        "flash_attention": false
     },
     "hyperparameter": {
-        "batch_size": 20,
-        "global_batch_size": 640,
+        "batch_size": 4,
+        "global_batch_size": 512,
         "learning_rate": 0.0001,
         "min_lr": 0.00001,
         "num_epochs": 2,
-        "steps_per_epoch": 20,
-        "warmup_steps": 20
+        "steps_per_epoch": 10,
+        "warmup_steps": 10
     },
     "fp16": {
         "initial_scale": 1.0
